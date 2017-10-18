@@ -38,6 +38,8 @@ import org.piax.pubsub.MqTopic;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+
+
 public class PeerMqEngine implements MqEngine,
         OverlayListener<Destination, LATKey> {
     private static final Logger logger = LoggerFactory
@@ -58,6 +60,9 @@ public class PeerMqEngine implements MqEngine,
 
     public static int DELIVERY_TIMEOUT = 3000;
     int seqNo;
+    
+    //複数delegator使用時のseqNo管理用
+    ConcurrentHashMap<Integer, Integer> seqNoManage = new ConcurrentHashMap<Integer, Integer>(); 
 
     public PeerMqEngine(Overlay<Destination, LATKey> overlay)
             throws MqException {
@@ -99,6 +104,9 @@ public class PeerMqEngine implements MqEngine,
             MqMessage message) {
         DelegatorIf dif = d.getStub(e);
         tokens.put(token.seqNo, token);
+        /*
+         * TODO: 複数delegatorに対応する必要あり
+         */
         dif.delegate(o.getLowerTransport().getEndpoint(), token.seqNo, topic,
                 message);
     }
@@ -120,13 +128,24 @@ public class PeerMqEngine implements MqEngine,
     }
 
     public void delegationSucceeded(int tokenId, String topic) {
+    	// TODO: 複数delegator探索に未対応無理やりスルーしてます
+    	if(!(tokens.isEmpty())) {
         PeerMqDeliveryToken token = tokens.get(tokenId);
         if (token == null) {
             logger.info("unregistered delivery succeeded: tokenId={}", tokenId);
         }
-        if (token.delegationSucceeded(topic)) {
-            tokens.remove(tokenId);
-        }
+        		if (token.delegationSucceeded(topic)) {
+        		/*
+        	 	* TODO :複数Delegator選択時にnullはく 調査必要
+        	 	* 		 通常では，tokenに値が入っている
+        	 	* 		 複数のdelegator上でdelegateメソッドが実行され，sender側で呼び出される.
+        	 	* 		 しかし，最初の一つで実行されることでnullになる
+        	 	* 		 どないしよう...
+        	 	* 		 どうやって複数delegator選択と単一delegator選択で処理を変えるか
+        	 	* 		1. topicにまぜてこちらで分割してコマンドとする
+        	 	*/
+        			tokens.remove(tokenId);
+        		}}
     }
 
     public void setSeed(String host, int port) {
@@ -342,7 +361,19 @@ public class PeerMqEngine implements MqEngine,
             if (noMatch) {
                 return ov.singletonFutureQueue(null); // the topic did not match. null return. 
             }
+            /*
+             * delegator探索時のquery(Topic)にマッチしたkeyをsubscribeしているノードが行う処理
+             * futureQueueに入れる値はString型のIP:port.clusterIDとしている(val)
+             * senderのfutureQueueには(peerID, val)という形で格納される
+             * DelegatorCommandの中がdelegatorsの場合に，clusterIDを含めた状態で値を返す．
+             */
+            if(com.command.equals("delegators")) {
+                String clusterContainEndpoint = (o.getLowerTransport().getEndpoint()).toString();
+                clusterContainEndpoint += ","+ this.clusterId;
+                return ov.singletonFutureQueue(clusterContainEndpoint);
+            }
             return ov.singletonFutureQueue(o.getLowerTransport().getEndpoint());
+
         }
 
         List<String> matched = new ArrayList<String>();
@@ -418,7 +449,20 @@ public class PeerMqEngine implements MqEngine,
         }
         return false;
     }
-
+    
+    /*
+     * TODO: 
+     */
+    public void incrementSeqNoManage(int tokenId) {
+    		Integer tokenValue = seqNoManage.get(tokenId);
+    		if(tokenValue == null) {
+    			seqNoManage.put(tokenId, 1);
+    		} else {
+    			tokenValue++;
+    			seqNoManage.replace(tokenId, tokenValue);
+    		}
+    }
+    
     public static void main(String args[]) {
         try {
             PeerMqEngine engine = new PeerMqEngine("localhost", 12367);

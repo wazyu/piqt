@@ -19,6 +19,7 @@ import org.piax.gtrans.TransOptions;
 import org.piax.gtrans.TransOptions.ResponseType;
 import org.piax.gtrans.TransOptions.RetransMode;
 import org.piax.gtrans.ov.Overlay;
+import org.piax.gtrans.ov.ring.rq.MessagePath;
 import org.piax.pubsub.MqActionListener;
 import org.piax.pubsub.MqCallback;
 import org.piax.pubsub.MqDeliveryToken;
@@ -28,6 +29,17 @@ import org.piax.pubsub.MqTopic;
 import org.piax.util.KeyComparator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+
+import org.piax.gtrans.ov.szk.*; //debug用
+import org.piax.gtrans.raw.udp.UdpLocator;
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.HashMap;
+
+
+
+
 
 public class PeerMqDeliveryToken implements MqDeliveryToken {
     private static final Logger logger = LoggerFactory
@@ -44,6 +56,8 @@ public class PeerMqDeliveryToken implements MqDeliveryToken {
     int seqNo = 0;
     public static int ACK_INTERVAL = -1;
     public static boolean USE_DELEGATE = true;
+    //複数delegaor用flag
+    public static boolean USE_DEELGATORS = true;
 
     TopicDelegator[] delegators;
 
@@ -110,6 +124,73 @@ public class PeerMqDeliveryToken implements MqDeliveryToken {
         return ds;
     }
 
+    public TopicDelegator[] findDelegatorsPerCluster(PeerMqEngine engine,
+            String[] topics, int qos) throws MqException {
+
+    	    FutureQueue<?>[] qs = new FutureQueue<?>[topics.length];
+        //TopicDelegator[] ds = new TopicDelegator[topics.length];
+    	    ArrayList<TopicDelegator> ds = new ArrayList<>();
+        
+        try {
+            for (int i = 0; i < topics.length; i++) {
+                RetransMode mode;
+                ResponseType type;
+                TransOptions mesOpts;
+                type = ResponseType.AGGREGATE;
+                mode = RetransMode.FAST;
+                mesOpts = new TransOptions(PeerMqEngine.DELIVERY_TIMEOUT, type,mode);
+                /*
+                 * onReceiveではDelegatorCommandの中を確認する
+                 */
+                qs[i] = o.request(
+                        new KeyRange<LATKey>(new LATKey(LATopic.topicMin(topics[i])),
+                                new LATKey(LATopic.topicMax(topics[i]))), 
+                        		   (Object) new DelegatorCommand("delegators", topics[i]),
+                        		   mesOpts);
+            }
+            for (int i = 0; i < qs.length; i++) {
+                		HashMap<String, Endpoint> dsMap = new HashMap<>();
+                		HashMap<String, String> cpMap = new HashMap<>();
+
+                    //System.out.println("topic : "+topics[i]);
+                    for (RemoteValue<?> rv : qs[i]) {
+                    		//System.out.println("rv : "+rv);
+                    		/*
+                    		 * StringでEndPoint(ip:port,cluster)を取得する
+                    		 * clusterを分離し，UdpLocatorインスタンスを再構築しEndPointとしている
+                    		 */
+                    		//System.out.println("delegator : "+rv.getValue());
+                    		String clusterContain = (String)rv.getValue();
+                    		String[] splitInCluster = clusterContain.split(",");
+                    		String[] splitOfIpPort = splitInCluster[0].split(":");
+                    		//どちらのmapに同一clusterの情報がない場合と，
+                    		if(!(dsMap.containsKey(splitInCluster[1])) || !(cpMap.containsKey(splitInCluster[1])) 
+                    				|| (rv.getPeer().toString().compareTo(cpMap.get(splitInCluster[1].toString())) < 0)) {
+                				Endpoint e = (Endpoint)(new UdpLocator(new InetSocketAddress(splitOfIpPort[0], Integer.parseInt(splitOfIpPort[1]))));
+                				if(e != null){
+            					/*
+            					 * TODO:何かアイデアがあれば 何か処理をするなら分離したい
+            					 */	
+            					dsMap.put(splitInCluster[1], e);
+            					cpMap.put(splitInCluster[1], rv.getPeer().toString());
+                				}
+                    		}
+                    }
+                    /*
+                     * dsはListで追加していく
+                     * 返すときには配列に変換して返す
+                     */
+                    for (String key : dsMap.keySet()) {
+                    		ds.add(new TopicDelegator(dsMap.get(key), topics[i]));
+					}
+                    //System.out.println("dsMap : "+dsMap);
+            }
+        } catch (Exception e) {
+            throw new MqException(e);
+        }
+        return (TopicDelegator[]) ds.toArray(new TopicDelegator[ds.size()]);
+    }
+    
     boolean delegationCompleted() {
         for (TopicDelegator d : delegators) {
             if (d != null) {
@@ -165,7 +246,11 @@ public class PeerMqDeliveryToken implements MqDeliveryToken {
 
     public void startDelivery(PeerMqEngine engine) throws MqException {
         if (USE_DELEGATE) {
-            startDeliveryDelegate(engine);
+        		if (USE_DEELGATORS) { //複数delegator探索
+        			startDeliveryDelegatePerCluster(engine);
+			} else {
+				startDeliveryDelegate(engine);
+			}
         } else {
             startDeliveryEach(engine);
         }
@@ -198,6 +283,7 @@ public class PeerMqDeliveryToken implements MqDeliveryToken {
             }
             else {
                 // fall back.
+            		System.out.println("findDelegate failed : "+delegators.length);
                 startDeliveryEach(engine);
             }
         } else {
@@ -212,6 +298,45 @@ public class PeerMqDeliveryToken implements MqDeliveryToken {
          */
     }
 
+    public void startDeliveryDelegatePerCluster(PeerMqEngine engine) throws MqException {
+        String topic = m.getTopic();
+        String[] pStrs = new MqTopic(topic).getPublisherKeyStrings();
+        int qos = m.getQos();
+        /* delegators for the topic */
+        delegators = engine.getDelegators(topic);
+        if (delegators == null) {
+            delegators = findDelegatorsPerCluster(engine, pStrs, qos);
+            //System.out.println("delegate : "+delegators);
+            boolean found = false;
+            for (int i = 0; i < delegators.length; i++) {
+                if (delegators[i] != null) {
+                    found = true;
+                }
+            }
+            if (found) {
+                engine.foundDelegators(m.getTopic(), delegators);
+                for (TopicDelegator d : delegators) {
+                    if (d != null) {
+                        logger.debug("delegate: endpoint={}, topic={}, m={}",
+                                d.endpoint, d.topic, m);
+                        ;
+                        /*
+                         * Topicの末尾にoptionを追加 => delegateメソッドで複数delegatorかどうか確認する
+                         */
+                        engine.delegate(this, d.endpoint, (d.topic)+",MULTI", m);
+                    }
+                }
+            }
+            else {
+                // fall back.
+            		System.out.println("findDelegate failed : "+delegators.length);
+                startDeliveryEach(engine);
+            }
+        } else {
+            resetDelegators(delegators);
+        }
+    }
+    
     public void startDeliveryEach(PeerMqEngine engine) throws MqException {
         try {
             String topic = m.getTopic();

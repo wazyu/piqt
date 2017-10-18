@@ -12,9 +12,12 @@ package org.piax.pubsub.stla;
 import java.io.IOException;
 import java.io.Serializable;
 
+import org.piax.common.ComparableKey;
 import org.piax.common.Endpoint;
 import org.piax.common.TransportId;
+import org.piax.common.subspace.CircularRange;
 import org.piax.common.subspace.KeyRange;
+import org.piax.common.subspace.Range;
 import org.piax.gtrans.ChannelTransport;
 import org.piax.gtrans.FutureQueue;
 import org.piax.gtrans.IdConflictException;
@@ -23,8 +26,10 @@ import org.piax.gtrans.RemoteValue;
 import org.piax.gtrans.TransOptions;
 import org.piax.gtrans.TransOptions.ResponseType;
 import org.piax.gtrans.TransOptions.RetransMode;
+import org.piax.gtrans.ov.ddll.DdllKey;
 import org.piax.pubsub.MqException;
 import org.piax.pubsub.MqMessage;
+import org.piax.util.UniqId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,6 +54,8 @@ public class Delegator<E extends Endpoint> extends RPCInvoker<DelegatorIf, E>
         logger.debug("peer {} delegated topic {}", engine.getPeerId(), topic);
         @SuppressWarnings("unchecked")
         DelegatorIf d = getStub((E) sender);
+        String[] splitTopic = topic.split(",", 2);
+
         try {
             RetransMode mode;
             ResponseType type;
@@ -72,11 +79,31 @@ public class Delegator<E extends Endpoint> extends RPCInvoker<DelegatorIf, E>
                         mode);
                 break;
             }
+            
+            /*
+             * TODO: 複数delegatorの動作
+             * 		 topicの末尾にoptionが付いているため，分割する
+             */
+            FutureQueue<?> fq;
+            if(splitTopic.length > 1) {
+                LATopic from = new LATopic(splitTopic[0]);
+                from.setClusterId(engine.getClusterId());
+                LATopic to = new LATopic(splitTopic[0]);
+                to.setClusterId(engine.getClusterId());
+                
+                //System.out.println("from :"+from+" to : "+to);
+                fq = engine.getOverlay().request(
+                        new KeyRange<LATKey>(new LATKey(from),false,
+                                new LATKey(to),true), (Object) m,
+                        mesOpts);
+            } else {
+                fq = engine.getOverlay().request(
+                        new KeyRange<LATKey>(new LATKey(LATopic.topicMin(splitTopic[0])),
+                                new LATKey(LATopic.topicMax(splitTopic[0]))), (Object) m,
+                        mesOpts);
+            }
 
-            FutureQueue<?> fq = engine.getOverlay().request(
-                    new KeyRange<LATKey>(new LATKey(LATopic.topicMin(topic)),
-                            new LATKey(LATopic.topicMax(topic))), (Object) m,
-                    mesOpts);
+            
             logger.debug("requested topic:" + topic + ", m=" + m + ",on " + engine.getHost() + ":" + engine.getPort());
             
             d.delegated((Endpoint) trans.getEndpoint(), tokenId, topic);
@@ -98,8 +125,9 @@ public class Delegator<E extends Endpoint> extends RPCInvoker<DelegatorIf, E>
             d.failed((Endpoint) trans.getEndpoint(), tokenId, topic,
                     MqException.REASON_CODE_UNEXPECTED_ERROR);
         }
-        d.succeeded((Endpoint) trans.getEndpoint(), tokenId, topic);
+        d.succeeded((Endpoint) trans.getEndpoint(), tokenId, splitTopic[0]);
     }
+    
 
     @Override
     public void delegated(Endpoint sender, int tokenId, String topic) {
@@ -109,6 +137,10 @@ public class Delegator<E extends Endpoint> extends RPCInvoker<DelegatorIf, E>
 
     @Override
     public void succeeded(Endpoint sender, int tokenId, String topic) {
+    	/*
+    	 * TODO:
+    	 * 
+    	 */
         logger.debug("peer:" + engine.getPeerId() + " received succeeded :"
                 + topic);
         engine.delegationSucceeded(tokenId, topic);
